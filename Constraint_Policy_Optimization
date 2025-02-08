@@ -1,0 +1,536 @@
+import numpy as np
+import torch
+import torch.nn as nn
+import matplotlib.pyplot as plt
+from torch.distributions import Normal
+from safety_gymnasium import make
+from torch.optim import Adam
+from tqdm import tqdm
+
+
+class Policy(nn.Module):
+    """
+    Policy network that outputs a Gaussian distribution over actions given observations.
+
+    Args:
+        obs_dim (int): Dimension of the observation space.
+        act_dim (int): Dimension of the action space.
+    """
+
+    def __init__(self, obs_dim: int, act_dim: int):
+        super().__init__()
+        self.obs_dim = obs_dim  # Store observation dimension
+
+        # Define the policy network architecture
+        self.policy_net = nn.Sequential(
+            nn.Linear(obs_dim, 64),  # Input layer mapping observations to 64 units
+            nn.Tanh(),  # Activation function
+            nn.Linear(64, 64),  # Hidden layer with 64 units
+            nn.Tanh(),  # Activation function
+            nn.Linear(64, act_dim * 2)  # Output layer producing mean and log_std for actions
+        )
+
+    def forward(self, obs: torch.Tensor) -> Normal:
+        """
+        Forward pass through the policy network to obtain an action distribution.
+
+        Args:
+            obs (torch.Tensor): Observation tensor of shape (batch_size, obs_dim) or (obs_dim,).
+
+        Returns:
+            torch.distributions.Normal: A Normal distribution parameterized by the network output.
+        """
+        if len(obs.shape) == 1:
+            # If input is a single observation, add a batch dimension
+            obs = obs.unsqueeze(0)
+        assert obs.shape[-1] == self.obs_dim, f"Expected observation dimension {self.obs_dim}, got {obs.shape[-1]}"
+
+        # Pass observations through the policy network
+        policy_params = self.policy_net(obs)
+
+        # Split the output into mean (mu) and log standard deviation (log_std)
+        mu, log_std = torch.chunk(policy_params, 2, dim=-1)
+
+        # Compute the standard deviation by exponentiating log_std
+        std = torch.exp(log_std)
+
+        # Return a Normal distribution with parameters mu and std
+        return Normal(mu, std)
+
+    def get_kl(self, obs: torch.Tensor, old_policy: nn.Module) -> torch.Tensor:
+        """
+        Compute the KL divergence between the current policy and an old policy over a batch of observations.
+
+        Args:
+            obs (torch.Tensor): Batch of observations.
+            old_policy (nn.Module): The previous policy network.
+
+        Returns:
+            torch.Tensor: The mean KL divergence across the batch.
+        """
+        # Get action distributions from current and old policies
+        pi = self(obs)
+        old_pi = old_policy(obs)
+
+        # Compute the KL divergence between the two distributions
+        kl = torch.distributions.kl.kl_divergence(old_pi, pi).mean()
+
+        # Return the mean KL divergence
+        return kl
+
+
+class ValueFunction(nn.Module):
+    """
+    Value function network that estimates the value of a given state.
+
+    Args:
+        obs_dim (int): Dimension of the observation space.
+    """
+
+    def __init__(self, obs_dim: int):
+        super().__init__()
+        self.obs_dim = obs_dim  # Store observation dimension
+
+        # Define the value network architecture
+        self.value_net = nn.Sequential(
+            nn.Linear(obs_dim, 64),  # Input layer mapping observations to 64 units
+            nn.Tanh(),  # Activation function
+            nn.Linear(64, 64),  # Hidden layer with 64 units
+            nn.Tanh(),  # Activation function
+            nn.Linear(64, 1)  # Output layer producing a single value estimate
+        )
+
+    def forward(self, obs: torch.Tensor) -> torch.Tensor:
+        """
+        Forward pass through the value network to obtain a value estimate.
+
+        Args:
+            obs (torch.Tensor): Observation tensor of shape (batch_size, obs_dim) or (obs_dim,).
+
+        Returns:
+            torch.Tensor: Estimated value(s) for the input observation(s).
+        """
+        if len(obs.shape) == 1:
+            # If input is a single observation, add a batch dimension
+            obs = obs.unsqueeze(0)
+
+        # Pass observations through the value network
+        value = self.value_net(obs).squeeze(-1)
+
+        # Remove unnecessary dimensions and return the value estimate
+        return value
+
+
+class CPO:
+    """
+    Constrained Policy Optimization (CPO) algorithm implementation.
+
+    Args:
+        env: The environment to train on.
+        delta (float): Safety constraint limit.
+        gamma (float): Discount factor for rewards.
+        lam (float): GAE (Generalized Advantage Estimation) lambda parameter.
+        max_kl (float): Maximum KL divergence for policy updates.
+    """
+
+    def __init__(self, env, delta: float = 0.01, gamma: float = 0.99, lam: float = 0.95, max_kl: float = 0.01):
+        self.render_enabled = True  # Enable rendering by default
+        # Select device (GPU if available, else CPU)
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.env = env  # Environment to interact with
+        # Obtain observation and action dimensions from the environment
+        self.obs_dim = self.env.observation_space.shape[0]
+        self.act_dim = self.env.action_space.shape[0]
+
+        # Initialize the policy networks
+        self.policy = Policy(self.obs_dim, self.act_dim).to(self.device)  # Current policy network
+        self.old_policy = Policy(self.obs_dim, self.act_dim).to(self.device)  # Previous policy network
+        self.optimizer = Adam(self.policy.parameters(), lr=3e-4)  # Optimizer for policy updates
+
+        # Initialize value functions and their optimizers
+        self.vf = ValueFunction(self.obs_dim).to(self.device)  # Value function for rewards
+        self.cost_vf = ValueFunction(self.obs_dim).to(self.device)  # Value function for costs
+        self.vf_optimizer = Adam(self.vf.parameters(), lr=1e-3)  # Optimizer for reward value function
+        self.cost_vf_optimizer = Adam(self.cost_vf.parameters(), lr=1e-3)  # Optimizer for cost value function
+
+        # Set hyperparameters
+        self.gamma = gamma  # Discount factor
+        self.lam = lam  # GAE lambda parameter
+        self.delta = delta  # Safety constraint limit
+        self.max_kl = max_kl  # Maximum KL divergence
+
+        # Initialize lists to store learning progress
+        self.rewards_history = []  # Stores average rewards
+        self.costs_history = []  # Stores average costs
+
+    def compute_advantages(self, rewards: torch.Tensor, costs: torch.Tensor, masks: torch.Tensor, values: torch.Tensor,
+                           cost_values: torch.Tensor):
+        """
+        Compute the generalized advantage estimates (GAE) for rewards and costs.
+
+        Args:
+            rewards (torch.Tensor): Tensor of rewards collected during rollout.
+            costs (torch.Tensor): Tensor of costs collected during rollout.
+            masks (torch.Tensor): Tensor indicating non-terminal states (1 for non-terminal, 0 for terminal).
+            values (torch.Tensor): Tensor of value function estimates for rewards.
+            cost_values (torch.Tensor): Tensor of value function estimates for costs.
+
+        Returns:
+            Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+            Advantages, cost advantages, returns, and cost returns.
+        """
+        # Initialize tensors for advantages and returns
+        advantages = torch.zeros_like(rewards).to(self.device)  # Advantage estimates for rewards
+        cost_advantages = torch.zeros_like(costs).to(self.device)  # Advantage estimates for costs
+        returns = torch.zeros_like(rewards).to(self.device)  # Return estimates for rewards
+        cost_returns = torch.zeros_like(costs).to(self.device)  # Return estimates for costs
+
+        last_gae = 0  # Last GAE value for rewards
+        last_cost_gae = 0  # Last GAE value for costs
+
+        # Loop backwards through the time steps
+        for t in reversed(range(len(rewards))):
+            if t == len(rewards) - 1:
+                # At the last time step, there is no next value
+                next_value = 0
+                next_cost_value = 0
+                next_nonterminal = 0
+            else:
+                # Get the next value estimates
+                next_value = values[t + 1]
+                next_cost_value = cost_values[t + 1]
+                next_nonterminal = masks[t + 1]
+
+            # Compute the temporal difference errors for rewards and costs
+            delta = rewards[t] + self.gamma * next_value * next_nonterminal - values[t]
+            cost_delta = costs[t] + self.gamma * next_cost_value * next_nonterminal - cost_values[t]
+
+            # Compute the GAE for rewards
+            advantages[t] = last_gae = delta + self.gamma * self.lam * next_nonterminal * last_gae
+            # Compute the GAE for costs
+            cost_advantages[t] = last_cost_gae = cost_delta + self.gamma * self.lam * next_nonterminal * last_cost_gae
+
+            # Compute the returns
+            returns[t] = advantages[t] + values[t]
+            cost_returns[t] = cost_advantages[t] + cost_values[t]
+
+        # Standardize the advantages
+        advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+        cost_advantages = (cost_advantages - cost_advantages.mean()) / (cost_advantages.std() + 1e-8)
+
+        return advantages, cost_advantages, returns, cost_returns
+
+    def update_value_function(self, obs: torch.Tensor, returns: torch.Tensor):
+        """
+        Update the value function using Mean Squared Error loss.
+
+        Args:
+            obs (torch.Tensor): Batch of observations.
+            returns (torch.Tensor): Computed returns for the batch.
+        """
+        # Compute the value function loss
+        value_loss = ((self.vf(obs) - returns) ** 2).mean()
+        self.vf_optimizer.zero_grad()  # Reset gradients
+        value_loss.backward()  # Backpropagate the loss
+        self.vf_optimizer.step()  # Update the value function parameters
+
+    def update_cost_value_function(self, obs: torch.Tensor, cost_returns: torch.Tensor):
+        """
+        Update the cost value function using Mean Squared Error loss.
+
+        Args:
+            obs (torch.Tensor): Batch of observations.
+            cost_returns (torch.Tensor): Computed cost returns for the batch.
+        """
+        # Compute the cost value function loss
+        cost_value_loss = ((self.cost_vf(obs) - cost_returns) ** 2).mean()
+        self.cost_vf_optimizer.zero_grad()  # Reset gradients
+        cost_value_loss.backward()  # Backpropagate the loss
+        self.cost_vf_optimizer.step()  # Update the cost value function parameters
+
+    def update_policy(self, obs_batch: torch.Tensor, acts_batch: torch.Tensor, advs_batch: torch.Tensor,
+                      cost_advs_batch: torch.Tensor):
+        """
+        Update the policy network using Constrained Policy Optimization.
+
+        Args:
+            obs_batch (torch.Tensor): Batch of observations.
+            acts_batch (torch.Tensor): Batch of actions taken.
+            advs_batch (torch.Tensor): Computed advantages.
+            cost_advs_batch (torch.Tensor): Computed cost advantages.
+        """
+        # Get the action distributions from current and old policies
+        dist = self.policy(obs_batch)  # Current policy distribution
+        old_dist = self.old_policy(obs_batch)  # Old policy distribution
+
+        # Compute log probabilities of actions under current and old policies
+        log_probs = dist.log_prob(acts_batch).sum(-1)  # Log probs under current policy
+        old_log_probs = old_dist.log_prob(acts_batch).sum(-1).detach()  # Log probs under old policy
+
+        # Compute the probability ratio
+        ratio = torch.exp(log_probs - old_log_probs)
+        # Surrogate loss for rewards
+        surr_adv = (ratio * advs_batch).mean()
+        # Surrogate loss for costs
+        surr_cost = (ratio * cost_advs_batch).mean()
+
+        # Compute gradients of the surrogate advantage
+        grads = torch.autograd.grad(surr_adv, self.policy.parameters(), retain_graph=True)
+        grad = torch.cat([g.view(-1) for g in grads])  # Flatten the gradients
+
+        # Compute gradients of the surrogate cost
+        cost_grads = torch.autograd.grad(surr_cost, self.policy.parameters(), retain_graph=True)
+        b = torch.cat([g.view(-1) for g in cost_grads])  # Flatten the cost gradients
+
+        # Compute KL divergence between the old and new policies
+        kl = self.policy.get_kl(obs_batch, self.old_policy)
+        # Compute gradients of the KL divergence
+        kl_grads = torch.autograd.grad(kl, self.policy.parameters(), create_graph=True)
+        flat_kl_grads = torch.cat([g.view(-1) for g in kl_grads])  # Flatten the KL gradients
+
+        def Fvp(v: torch.Tensor) -> torch.Tensor:
+            """
+            Compute the Fisher-vector product.
+
+            Args:
+                v (torch.Tensor): Vector to multiply.
+
+            Returns:
+                torch.Tensor: Resulting vector after multiplication.
+            """
+            # Compute the product of the flat KL gradients and vector v
+            kl_v = (flat_kl_grads * v).sum()
+            # Compute the gradients of the product
+            kl_v_grads = torch.autograd.grad(kl_v, self.policy.parameters(), retain_graph=True)
+            kl_v_grads = torch.cat([g.contiguous().view(-1) for g in kl_v_grads])
+            # Add a damping term for numerical stability
+            return kl_v_grads + 0.01 * v
+
+        def conjugate_grad(Ax, b: torch.Tensor, nsteps: int, residual_tol: float = 1e-10) -> torch.Tensor:
+            """
+            Conjugate Gradient method to solve Ax = b.
+
+            Args:
+                Ax: Function that computes the matrix-vector product Ax.
+                b (torch.Tensor): Right-hand side vector.
+                nsteps (int): Maximum number of iterations.
+                residual_tol (float): Tolerance for convergence.
+
+            Returns:
+                torch.Tensor: Solution vector x.
+            """
+            x = torch.zeros_like(b)  # Initial solution x = 0
+            r = b.clone()  # Residual r = b - Ax
+            p = r.clone()  # Search direction
+            rdotr = torch.dot(r, r)  # Compute the dot product of residual
+
+            for i in range(nsteps):
+                Ap = Ax(p)  # Compute A*p
+                alpha = rdotr / (torch.dot(p, Ap) + 1e-8)  # Step size
+                x += alpha * p  # Update estimate of solution
+                r -= alpha * Ap  # Update residual
+                new_rdotr = torch.dot(r, r)  # Compute new residual norm
+                if new_rdotr < residual_tol:
+                    break  # Convergence achieved
+                beta = new_rdotr / rdotr  # Compute scaling factor
+                p = r + beta * p  # Update search direction
+                rdotr = new_rdotr
+            return x
+
+        # Define the Hessian-vector product function
+        Hx = lambda v: Fvp(v)
+        # Solve for the step direction using conjugate gradient
+        x = conjugate_grad(Hx, grad, nsteps=10)
+
+        # Compute the constraint value q
+        q = b.dot(x) - self.delta
+        if q < 0:
+            # If constraint is satisfied, compute scaling factor lambda
+            lam = torch.sqrt(2 * self.max_kl / (x.dot(Hx(x)) + 1e-8))
+            x = lam * x  # Scale the step direction
+        else:
+            # If constraint is violated, adjust step direction
+            nu = q / (x.dot(Hx(x)) + 1e-8)
+            x = x - nu * x  # Adjust the step direction
+
+        # Store old policy parameters
+        old_params = torch.cat([p.data.view(-1) for p in self.policy.parameters()])
+        step_size = 1.0  # Initial step size
+        expected_improve = grad.dot(x)  # Expected improvement in surrogate loss
+
+        # Perform backtracking line search
+        for _ in range(10):
+            # Compute new parameters
+            new_params = old_params + step_size * x
+            # Set new parameters to the policy network
+            self.set_params(new_params)
+            # Compute new KL divergence
+            kl = self.policy.get_kl(obs_batch, self.old_policy)
+            # Compute new surrogate advantage
+            surr_adv_new = (torch.exp(
+                self.policy(obs_batch).log_prob(acts_batch).sum(-1) - old_log_probs) * advs_batch).mean()
+            improve = surr_adv_new - surr_adv  # Improvement in surrogate advantage
+            if kl <= self.max_kl and improve > 0:
+                break  # Accept the step if constraints are satisfied
+            step_size *= 0.5  # Reduce step size
+        else:
+            # If no acceptable step found, revert to old parameters
+            self.set_params(old_params)
+
+        # Update the old policy with the new policy parameters
+        self.old_policy.load_state_dict(self.policy.state_dict())
+
+    def set_params(self, params: torch.Tensor):
+        """
+        Set the parameters of the policy network from a flat parameter vector.
+
+        Args:
+            params (torch.Tensor): Flat tensor containing all parameters.
+        """
+        idx = 0  # Starting index
+        for p in self.policy.parameters():
+            size = p.numel()  # Number of elements in parameter tensor
+            # Copy data from flat parameter vector to parameter tensor
+            p.data.copy_(params[idx:idx + size].view(p.shape))
+            idx += size  # Move to the next set of parameters
+
+    def train(self, n_iterations: int = 50, batch_size: int = 5000):
+        """
+        Train the policy using collected data.
+
+        Args:
+            n_iterations (int): Number of training iterations.
+            batch_size (int): Number of samples per batch.
+        """
+        for i in tqdm(range(n_iterations), desc="Training Progress"):
+            # Initialize buffers to collect data
+            obs_buf, act_buf, rew_buf, cost_buf, done_buf = [], [], [], [], []
+            next_obs_buf = []
+
+            obs, _ = self.env.reset()  # Reset the environment and get initial observation
+            done = False  # Initialize done flag
+
+            # Collect data until the batch size is reached
+            while len(obs_buf) < batch_size:
+                # Convert observation to numpy array
+                obs = np.asarray(obs, dtype=np.float32)
+                # Flatten the observation if necessary
+                if obs.ndim > 1:
+                    obs = obs.flatten()
+                elif isinstance(obs[0], (list, np.ndarray)):
+                    obs = np.concatenate([np.asarray(o, dtype=np.float32).flatten() for o in obs])
+
+                # Convert observation to tensor and move to device
+                obs_tensor = torch.FloatTensor(obs).to(self.device)
+                with torch.no_grad():
+                    # Get action distribution from the policy
+                    act_dist = self.policy(obs_tensor)
+                    # Sample action from the distribution
+                    act = act_dist.sample().cpu().numpy()
+                    act = np.clip(act, self.env.action_space.low, self.env.action_space.high)
+                    # Squeeze the action to remove the batch dimension
+                    act = np.squeeze(act, axis=0)
+
+                # Step the environment
+                # print(self.env.step(act))
+                next_obs, rew, cost, terminated, truncated, info = self.env.step(act)
+                done = bool(terminated or truncated)  # Combine terminated and truncated flags
+
+                # Get cost from info dictionary
+                cost = info.get('cost_sum', 0)
+
+                # Append data to buffers
+                obs_buf.append(obs)
+                act_buf.append(act)
+                rew_buf.append(rew)
+                cost_buf.append(cost)
+                done_buf.append(done)
+                next_obs_buf.append(next_obs)
+
+                if done:
+                    obs, _ = self.env.reset()  # Reset environment if done
+                else:
+                    obs = next_obs  # Move to the next observation
+
+            # Convert buffers to tensors and move to device
+            obs_tensor = torch.FloatTensor(np.array(obs_buf, dtype=np.float32)).to(self.device)
+            act_tensor = torch.FloatTensor(np.array(act_buf, dtype=np.float32)).to(self.device)
+            rew_tensor = torch.FloatTensor(np.array(rew_buf, dtype=np.float32)).to(self.device)
+            cost_tensor = torch.FloatTensor(np.array(cost_buf, dtype=np.float32)).to(self.device)
+            next_obs_tensor = torch.FloatTensor(np.array(next_obs_buf, dtype=np.float32)).to(self.device)
+            done_tensor = torch.FloatTensor(np.array(done_buf, dtype=np.float32)).to(self.device)
+
+            with torch.no_grad():
+                # Get value estimates from the value functions
+                values = self.vf(obs_tensor)
+                cost_values = self.cost_vf(obs_tensor)
+                next_values = self.vf(next_obs_tensor)
+                next_cost_values = self.cost_vf(next_obs_tensor)
+
+            # Create masks for non-terminal states
+            masks = 1 - done_tensor
+            # Compute advantages and returns
+            advantages, cost_advantages, returns, cost_returns = self.compute_advantages(
+                rew_tensor, cost_tensor, masks,
+                values, cost_values
+            )
+
+            # Update the value functions
+            self.update_value_function(obs_tensor, returns)
+            self.update_cost_value_function(obs_tensor, cost_returns)
+
+            # Update the policy network
+            self.update_policy(obs_tensor, act_tensor, advantages, cost_advantages)
+
+            # Compute average return and cost for the batch
+            avg_return = torch.mean(returns).item()
+            avg_cost = torch.mean(cost_tensor).item()
+            # Append to history
+            self.rewards_history.append(avg_return)
+            self.costs_history.append(avg_cost)
+
+            if i % 10 == 0:
+                # Print progress every 10 iterations
+                print(f"Iteration {i}")
+                print(f"Average Return: {avg_return:.2f}")
+                print(f"Average Cost: {avg_cost:.2f}")
+
+        # Plot learning curves after training
+        self.plot_learning_curves()
+
+    def plot_learning_curves(self):
+        """
+        Plot the learning curves for average returns and average costs over iterations.
+        """
+        plt.figure(figsize=(12, 5))
+
+        # Plot average return
+        plt.subplot(1, 2, 1)
+        plt.plot(self.rewards_history, label='Average Return')
+        plt.xlabel('Iteration')
+        plt.ylabel('Average Return')
+        plt.title('Learning Curve - Average Return')
+        plt.legend()
+
+        # Plot average cost
+        plt.subplot(1, 2, 2)
+        plt.plot(self.costs_history, label='Average Cost', color='r')
+        plt.xlabel('Iteration')
+        plt.ylabel('Average Cost')
+        plt.title('Learning Curve - Average Cost')
+        plt.legend()
+
+        plt.tight_layout()
+        plt.show()
+
+
+if __name__ == "__main__":
+    # Initialize the environment with a fixed random seed
+    env = make('SafetyCarGoal1-v0', render_mode='human')  # Create the environment
+
+    seed = 42  # Set a random seed
+    env.reset(seed=seed)  # Reset the environment with the seed
+    np.random.seed(seed)  # Set numpy random seed
+    cpo = CPO(env)  # Initialize the CPO algorithm
+    cpo.train()  # Start training
+
